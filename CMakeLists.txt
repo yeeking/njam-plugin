@@ -7,8 +7,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 project(myk-neural-jammer VERSION 0.0.1)
 
 add_subdirectory(./libs/JUCE JUCE)  
-# uncomment for static libraries build, which is slower but easier to share your plugin :) 
-# set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build llama as a static library")                
 # makes the static library build work with JUCE
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -56,6 +54,7 @@ set(GGML_BLAS_VENDOR ${NJAM_LLAMA_BLAS_VENDOR} CACHE STRING "ggml: BLAS library 
 set(GGML_METAL ${NJAM_LLAMA_METAL} CACHE BOOL "ggml: use Metal" FORCE)
 set(GGML_VULKAN ${NJAM_LLAMA_VULKAN} CACHE BOOL "ggml: use Vulkan" FORCE)
 
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build llama.cpp as static libraries" FORCE)
 add_subdirectory(./libs/llama.cpp llama.cpp)
 
 ## command-line test programs
@@ -125,4 +124,3 @@ target_link_libraries(myk-neural-jammer-plugin
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags)
-

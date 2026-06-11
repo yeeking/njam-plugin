@@ -1,4 +1,4 @@
-clone juce and llamacpp in here
+put your libs in here...
 
 ```
 git clone https://github.com/ggml-org/llama.cpp.git
