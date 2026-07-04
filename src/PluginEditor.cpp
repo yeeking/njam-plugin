@@ -9,366 +9,233 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include <algorithm>
-#include <cmath>
 #include <iomanip>
 #include <sstream>
 
-namespace
-{
-constexpr double pianoRollWindowSeconds = 10.0;
-constexpr int lowestDisplayedMidiNote = 24;
-constexpr int highestDisplayedMidiNote = 108;
-}
-
-class OpenGLPianoRollComponent final : public juce::Component,
-                                       private juce::OpenGLRenderer
+class ChatTranscriptComponent final : public juce::Component
 {
 public:
-    explicit OpenGLPianoRollComponent (juce::Colour defaultNoteColour)
-        : noteColour (defaultNoteColour)
+    void setTranscript (const juce::String& newTranscript, int viewportWidth)
     {
-        openGLContext.setRenderer (this);
-        openGLContext.setContinuousRepainting (false);
-        openGLContext.attachTo (*this);
+        if (newTranscript == transcript && viewportWidth == lastLayoutWidth)
+            return;
+
+        transcript = newTranscript;
+        lastLayoutWidth = viewportWidth;
+        rebuildLayout (juce::jmax (160, viewportWidth));
+        repaint();
     }
 
-    ~OpenGLPianoRollComponent() override
+    int getPreferredHeight() const
     {
-        shutdown();
+        return preferredHeight;
     }
 
-    void setSnapshot (const PianoRollDisplaySnapshot& newSnapshot)
+    void paint (juce::Graphics& g) override
     {
-        const juce::ScopedLock lock (snapshotLock);
-        snapshot = newSnapshot;
-        snapshotReceivedMs = juce::Time::getMillisecondCounterHiRes();
-        openGLContext.triggerRepaint();
-    }
+        g.fillAll (juce::Colours::black.withAlpha (0.55f));
 
-    void requestRender()
-    {
-        openGLContext.triggerRepaint();
-    }
+        for (const auto& block : blocks)
+        {
+            const auto bubble = block.bounds.toFloat();
+            g.setColour (block.role == "You"
+                             ? juce::Colour (0xff20343b)
+                             : juce::Colour (0xff1c2528));
+            g.fillRoundedRectangle (bubble, 7.0f);
 
-    void shutdown()
-    {
-        openGLContext.setContinuousRepainting (false);
-        openGLContext.detach();
+            g.setColour (block.role == "You"
+                             ? juce::Colour (0xff92d8ff)
+                             : juce::Colour (0xffa7f3c4));
+            g.drawRoundedRectangle (bubble, 7.0f, 1.0f);
+
+            block.layout.draw (g, block.textArea.toFloat());
+        }
     }
 
 private:
-    void newOpenGLContextCreated() override {}
-    void openGLContextClosing() override {}
-
-    void renderOpenGL() override
+    struct MessageBlock
     {
-        juce::OpenGLHelpers::clear (juce::Colours::transparentBlack);
+        juce::String role;
+        juce::String content;
+        juce::TextLayout layout;
+        juce::Rectangle<int> bounds;
+        juce::Rectangle<int> textArea;
+    };
 
-        const auto scale = openGLContext.getRenderingScale();
-        const int width = getWidth();
-        const int height = getHeight();
-        juce::gl::glViewport (0, 0, juce::roundToInt (width * scale), juce::roundToInt (height * scale));
-
-        juce::gl::glMatrixMode (juce::gl::GL_PROJECTION);
-        juce::gl::glLoadIdentity();
-        juce::gl::glOrtho (0.0, static_cast<double> (width), static_cast<double> (height), 0.0, -1.0, 1.0);
-        juce::gl::glMatrixMode (juce::gl::GL_MODELVIEW);
-        juce::gl::glLoadIdentity();
-
-        PianoRollDisplaySnapshot localSnapshot;
-        double receivedMs = 0.0;
-        {
-            const juce::ScopedLock lock (snapshotLock);
-            localSnapshot = snapshot;
-            receivedMs = snapshotReceivedMs;
-        }
-
-        drawBackground (width, height);
-        if (localSnapshot.sampleRate <= 0.0)
-            return;
-
-        const double elapsedSeconds = std::max (0.0, (juce::Time::getMillisecondCounterHiRes() - receivedMs) / 1000.0);
-        const int64_t estimatedLatestSample = localSnapshot.latestSample
-            + static_cast<int64_t> (elapsedSeconds * localSnapshot.sampleRate);
-        const int64_t visibleWindowSamples = static_cast<int64_t> (localSnapshot.sampleRate * pianoRollWindowSeconds);
-        const int64_t visibleStartSample = estimatedLatestSample - visibleWindowSamples;
-
-        drawGrid (width, height);
-        drawNotes (localSnapshot, visibleStartSample, visibleWindowSamples, width, height);
-        drawOverlay (localSnapshot, estimatedLatestSample, visibleStartSample, visibleWindowSamples, width, height);
+    static bool isRoleLine (const juce::String& line, const juce::String& role)
+    {
+        return line.startsWith (role + ":");
     }
 
-    void drawBackground (int width, int height) const
+    std::vector<MessageBlock> parseTranscript() const
     {
-        const auto colour = juce::Colours::black;
-        juce::gl::glColor4f (colour.getFloatRed(), colour.getFloatGreen(), colour.getFloatBlue(), colour.getFloatAlpha());
-        juce::gl::glBegin (juce::gl::GL_QUADS);
-        juce::gl::glVertex2f (0.0f, 0.0f);
-        juce::gl::glVertex2f (static_cast<float> (width), 0.0f);
-        juce::gl::glVertex2f (static_cast<float> (width), static_cast<float> (height));
-        juce::gl::glVertex2f (0.0f, static_cast<float> (height));
-        juce::gl::glEnd();
-    }
+        std::vector<MessageBlock> parsed;
+        juce::StringArray lines;
+        lines.addLines (transcript);
 
-    void drawGrid (int width, int height) const
-    {
-        const auto gridColour = juce::Colours::black;
-        juce::gl::glColor4f (gridColour.getFloatRed(), gridColour.getFloatGreen(), gridColour.getFloatBlue(), gridColour.getFloatAlpha());
-        juce::gl::glBegin (juce::gl::GL_LINES);
-        for (int i = 0; i <= 8; ++i)
+        MessageBlock* current = nullptr;
+        for (const auto& line : lines)
         {
-            const float x = static_cast<float> (width * i) / 8.0f;
-            juce::gl::glVertex2f (x, 0.0f);
-            juce::gl::glVertex2f (x, static_cast<float> (height));
-        }
-
-        constexpr int noteRange = highestDisplayedMidiNote - lowestDisplayedMidiNote + 1;
-        for (int i = 0; i <= noteRange; ++i)
-        {
-            const float y = static_cast<float> (height * i) / static_cast<float> (noteRange);
-            juce::gl::glVertex2f (0.0f, y);
-            juce::gl::glVertex2f (static_cast<float> (width), y);
-        }
-        juce::gl::glEnd();
-    }
-
-    void drawNotes (const PianoRollDisplaySnapshot& localSnapshot,
-                    int64_t visibleStartSample,
-                    int64_t visibleWindowSamples,
-                    int width,
-                    int height) const
-    {
-        constexpr int noteRange = highestDisplayedMidiNote - lowestDisplayedMidiNote + 1;
-        juce::gl::glColor4f (noteColour.getFloatRed(), noteColour.getFloatGreen(), noteColour.getFloatBlue(), noteColour.getFloatAlpha());
-        juce::gl::glBegin (juce::gl::GL_QUADS);
-        for (const auto& note : localSnapshot.notes)
-        {
-            const int64_t clippedStart = std::max<int64_t> (note.startSample, visibleStartSample);
-            const int64_t clippedEnd = std::min<int64_t> (note.endSample, visibleStartSample + visibleWindowSamples);
-            if (clippedEnd <= clippedStart)
+            if (isRoleLine (line, "You") || isRoleLine (line, "Agent"))
+            {
+                MessageBlock block;
+                block.role = line.upToFirstOccurrenceOf (":", false, false).trim();
+                block.content = line.fromFirstOccurrenceOf (":", false, false).trimStart();
+                parsed.push_back (std::move (block));
+                current = &parsed.back();
                 continue;
+            }
 
-            const float x1 = static_cast<float> (clippedStart - visibleStartSample) * static_cast<float> (width)
-                / static_cast<float> (visibleWindowSamples);
-            const float x2 = static_cast<float> (clippedEnd - visibleStartSample) * static_cast<float> (width)
-                / static_cast<float> (visibleWindowSamples);
-
-            const int clampedNote = juce::jlimit (lowestDisplayedMidiNote, highestDisplayedMidiNote, note.noteNumber);
-            const float noteTop = static_cast<float> (height)
-                - static_cast<float> (clampedNote - lowestDisplayedMidiNote + 1) * static_cast<float> (height) / static_cast<float> (noteRange);
-            const float noteHeight = std::max (2.0f, static_cast<float> (height) / static_cast<float> (noteRange));
-
-            juce::gl::glVertex2f (x1, noteTop);
-            juce::gl::glVertex2f (std::max (x1 + 2.0f, x2), noteTop);
-            juce::gl::glVertex2f (std::max (x1 + 2.0f, x2), noteTop + noteHeight);
-            juce::gl::glVertex2f (x1, noteTop + noteHeight);
+            if (current != nullptr)
+            {
+                if (current->content.isNotEmpty())
+                    current->content << "\n";
+                current->content << line;
+            }
         }
-        juce::gl::glEnd();
+
+        return parsed;
     }
 
-    void drawOverlay (const PianoRollDisplaySnapshot& localSnapshot,
-                      int64_t estimatedLatestSample,
-                      int64_t visibleStartSample,
-                      int64_t visibleWindowSamples,
-                      int width,
-                      int height) const
+    void rebuildLayout (int viewportWidth)
     {
-        if (! localSnapshot.overlay.active || localSnapshot.sampleRate <= 0.0)
-            return;
+        blocks = parseTranscript();
+        constexpr int outerPadding = 8;
+        constexpr int bubblePadding = 10;
+        constexpr int gap = 8;
+        constexpr int minEmptyHeight = 44;
 
-        const double ageSeconds = static_cast<double> (estimatedLatestSample - localSnapshot.overlay.triggerSample) / localSnapshot.sampleRate;
-        if (ageSeconds < 0.0 || ageSeconds > 4.0)
-            return;
+        int y = outerPadding;
+        const int availableWidth = juce::jmax (120, viewportWidth - (outerPadding * 2));
 
-        const float alpha = [&]()
+        for (auto& block : blocks)
         {
-            if (ageSeconds <= 1.5)
-                return 1.0f;
+            juce::AttributedString text;
+            text.setWordWrap (juce::AttributedString::byWord);
+            text.setJustification (juce::Justification::topLeft);
 
-            const double fadeProgress = juce::jlimit (0.0, 1.0, (ageSeconds - 1.5) / (4.0 - 1.5));
-            return static_cast<float> ((1.0 - fadeProgress) * (1.0 - fadeProgress));
-        }();
+            text.append (block.role + "\n",
+                         juce::FontOptions (15.0f).withStyle ("Bold"),
+                         block.role == "You" ? juce::Colour (0xffb9e6ff) : juce::Colour (0xffbbf7d0));
 
-        const int64_t overlayStart = std::max<int64_t> (localSnapshot.overlay.startSample, visibleStartSample);
-        const int64_t overlayEnd = std::min<int64_t> (localSnapshot.overlay.endSample, visibleStartSample + visibleWindowSamples);
-        if (overlayEnd <= overlayStart)
-            return;
+            const auto content = block.content.trim().isEmpty()
+                ? juce::String ("...")
+                : block.content.trim();
 
-        const float x1 = static_cast<float> (overlayStart - visibleStartSample) * static_cast<float> (width)
-            / static_cast<float> (visibleWindowSamples);
-        const float x2 = static_cast<float> (overlayEnd - visibleStartSample) * static_cast<float> (width)
-            / static_cast<float> (visibleWindowSamples);
-        const auto borderColour = juce::Colours::gold.withAlpha (0.85f * alpha);
+            const bool looksDiagnostic = content.startsWithChar ('[');
+            text.append (content,
+                         juce::FontOptions (15.0f),
+                         looksDiagnostic ? juce::Colour (0xffffd28a) : juce::Colours::white.withAlpha (0.94f));
 
-        juce::gl::glColor4f (borderColour.getFloatRed(), borderColour.getFloatGreen(), borderColour.getFloatBlue(), borderColour.getFloatAlpha());
-        juce::gl::glLineWidth (3.0f);
-        juce::gl::glBegin (juce::gl::GL_LINE_LOOP);
-        juce::gl::glVertex2f (x1, 1.0f);
-        juce::gl::glVertex2f (x2, 1.0f);
-        juce::gl::glVertex2f (x2, static_cast<float> (height - 1));
-        juce::gl::glVertex2f (x1, static_cast<float> (height - 1));
-        juce::gl::glEnd();
-        juce::gl::glLineWidth (1.0f);
+            block.layout.createLayout (text, static_cast<float> (availableWidth - (bubblePadding * 2)));
+
+            const int textHeight = juce::roundToInt (block.layout.getHeight());
+            const int bubbleHeight = juce::jmax (minEmptyHeight, textHeight + (bubblePadding * 2));
+            block.bounds = { outerPadding, y, availableWidth, bubbleHeight };
+            block.textArea = block.bounds.reduced (bubblePadding);
+            y += bubbleHeight + gap;
+        }
+
+        preferredHeight = juce::jmax (y + outerPadding, getParentHeight());
+        setSize (viewportWidth, preferredHeight);
     }
 
-    juce::OpenGLContext openGLContext;
-    juce::CriticalSection snapshotLock;
-    PianoRollDisplaySnapshot snapshot;
-    double snapshotReceivedMs = 0.0;
-    juce::Colour noteColour;
+    juce::String transcript;
+    std::vector<MessageBlock> blocks;
+    int lastLayoutWidth = 0;
+    int preferredHeight = 80;
 };
 
 //==============================================================================
 NJamPluginEditor::NJamPluginEditor (NJamPluginProcessor& p)
     : AudioProcessorEditor (&p),
-      keyboardComponent (keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard),
       audioProcessor (p)
 {
-    keyboardState.addListener (this);
-    keyboardComponent.setAvailableRange (24, 108);
-    keyboardComponent.setWantsKeyboardFocus (false);
-    addAndMakeVisible (keyboardComponent);
+    chatLabel.setText ("Music Agent Chat", juce::dontSendNotification);
+    chatLabel.setJustificationType (juce::Justification::centredLeft);
+    addAndMakeVisible (chatLabel);
 
-    contextRollComponent = std::make_unique<OpenGLPianoRollComponent> (juce::Colours::skyblue);
-    outputRollComponent = std::make_unique<OpenGLPianoRollComponent> (juce::Colours::lightgreen);
-    addAndMakeVisible (*contextRollComponent);
-    addAndMakeVisible (*outputRollComponent);
+    chatTranscriptComponent = std::make_unique<ChatTranscriptComponent>();
+    chatTranscriptViewport.setViewedComponent (chatTranscriptComponent.get(), false);
+    chatTranscriptViewport.setScrollBarsShown (true, false);
+    addAndMakeVisible (chatTranscriptViewport);
 
-    btn.setButtonText ("MIDI Thru");
-    btn.setClickingTogglesState (true);
-    btn.setToggleState (audioProcessor.isMidiThruEnabled(), juce::dontSendNotification);
-    btn.setColour (juce::TextButton::buttonOnColourId, juce::Colours::limegreen);
-    btn.setColour (juce::TextButton::buttonColourId, juce::Colours::darkgrey);
-    btn.onClick = [this] { audioProcessor.setMidiThruEnabled (btn.getToggleState()); };
-    addAndMakeVisible (btn);
+    chatPromptEditor.setMultiLine (true);
+    chatPromptEditor.setReturnKeyStartsNewLine (true);
+    chatPromptEditor.setTextToShowWhenEmpty ("Ask for a musical idea, arrangement, MIDI file, or playback step...", juce::Colours::grey);
+    addAndMakeVisible (chatPromptEditor);
 
-    loadModelButton.setButtonText ("Load GGUF");
-    loadModelButton.onClick = [this]
+    sendChatButton.setButtonText ("Send");
+    sendChatButton.onClick = [this]
     {
-        modelChooser = std::make_unique<juce::FileChooser> ("Select a GGUF model", juce::File{}, "*.gguf");
-        modelChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
-                                   [this] (const juce::FileChooser& chooser)
-                                   {
-                                       const auto result = chooser.getResult();
-                                       if (result.existsAsFile())
-                                           audioProcessor.loadModelFromPath (result.getFullPathName());
-
-                                       modelChooser.reset();
-                                   });
+        const auto prompt = chatPromptEditor.getText();
+        if (prompt.trim().isNotEmpty())
+        {
+            audioProcessor.sendChatPrompt (prompt);
+            chatPromptEditor.clear();
+        }
     };
-    addAndMakeVisible (loadModelButton);
+    addAndMakeVisible (sendChatButton);
 
-    auto configureContextButton = [this] (juce::TextButton& button, const juce::String& text, int contextLength)
-    {
-        button.setButtonText (text);
-        button.setClickingTogglesState (true);
-        button.setRadioGroupId (1001);
-        button.setColour (juce::TextButton::buttonColourId, juce::Colours::darkslategrey);
-        button.setColour (juce::TextButton::buttonOnColourId, juce::Colours::red);
-        button.onClick = [this, contextLength] { audioProcessor.setContextLength (contextLength); };
-        addAndMakeVisible (button);
-    };
+    clearChatButton.setButtonText ("Clear");
+    clearChatButton.onClick = [this] { audioProcessor.clearChat(); };
+    addAndMakeVisible (clearChatButton);
 
-    configureContextButton (ctx128Button, "256", 256);
-    configureContextButton (ctx256Button, "512", 512);
-    configureContextButton (ctx512Button, "1024", 1024);
-    configureContextButton (ctx1024Button, "2048", 2048);
+    remoteModelToggle.setButtonText ("Remote");
+    remoteModelToggle.setToggleState (true, juce::dontSendNotification);
+    remoteModelToggle.setEnabled (false);
+    audioProcessor.setUseRemoteModel (true);
+    addAndMakeVisible (remoteModelToggle);
 
-    auto configureTokenButton = [this] (juce::TextButton& button, const juce::String& text, int maxTokens)
-    {
-        button.setButtonText (text);
-        button.setClickingTogglesState (true);
-        button.setRadioGroupId (1002);
-        button.setColour (juce::TextButton::buttonColourId, juce::Colours::darkolivegreen);
-        button.setColour (juce::TextButton::buttonOnColourId, juce::Colours::orange);
-        button.onClick = [this, maxTokens] { audioProcessor.setMaxResponseTokens (maxTokens); };
-        addAndMakeVisible (button);
-    };
+    endpointLabel.setText ("Endpoint", juce::dontSendNotification);
+    addAndMakeVisible (endpointLabel);
 
-    configureTokenButton (tokens32Button, "64", 64);
-    configureTokenButton (tokens64Button, "128", 128);
-    configureTokenButton (tokens128Button, "256", 256);
-    configureTokenButton (tokens256Button, "512", 512);
-
-    waitTimeLabel.setText ("Wait Time (s)", juce::dontSendNotification);
-    addAndMakeVisible (waitTimeLabel);
-
-    contextLengthLabel.setText ("Memory", juce::dontSendNotification);
-    addAndMakeVisible (contextLengthLabel);
-
-    maxTokensLabel.setText ("Gen Length", juce::dontSendNotification);
-    addAndMakeVisible (maxTokensLabel);
-
-    selfListenLabel.setText ("Self Listen", juce::dontSendNotification);
-    addAndMakeVisible (selfListenLabel);
-
-    lookBackTimeLabel.setText ("Look Back", juce::dontSendNotification);
-    addAndMakeVisible (lookBackTimeLabel);
-
-    maxNoteLengthLabel.setText ("Max Note Len", juce::dontSendNotification);
-    addAndMakeVisible (maxNoteLengthLabel);
-
-    timingMultiplierLabel.setText ("Timing Mult", juce::dontSendNotification);
-    addAndMakeVisible (timingMultiplierLabel);
-
-    waitTimeSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    waitTimeSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
-    waitTimeSlider.setNumDecimalPlacesToDisplay (2);
-    waitTimeSlider.setTextValueSuffix (" s");
-    addAndMakeVisible (waitTimeSlider);
-
-    selfListenSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    selfListenSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
-    selfListenSlider.setNumDecimalPlacesToDisplay (2);
-    addAndMakeVisible (selfListenSlider);
-
-    lookBackTimeSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    lookBackTimeSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
-    lookBackTimeSlider.setNumDecimalPlacesToDisplay (2);
-    lookBackTimeSlider.setTextValueSuffix (" s");
-    addAndMakeVisible (lookBackTimeSlider);
-
-    maxNoteLengthSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    maxNoteLengthSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
-    maxNoteLengthSlider.setNumDecimalPlacesToDisplay (2);
-    maxNoteLengthSlider.setTextValueSuffix (" s");
-    addAndMakeVisible (maxNoteLengthSlider);
-
-    timingMultiplierSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    timingMultiplierSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
-    timingMultiplierSlider.setNumDecimalPlacesToDisplay (2);
-    addAndMakeVisible (timingMultiplierSlider);
-
-    waitTimeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        audioProcessor.getValueTreeState(), "waitTimeSeconds", waitTimeSlider);
-    selfListenAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        audioProcessor.getValueTreeState(), "selfListen", selfListenSlider);
-    lookBackTimeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        audioProcessor.getValueTreeState(), "lookBackTimeSeconds", lookBackTimeSlider);
-    maxNoteLengthAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        audioProcessor.getValueTreeState(), "maxGeneratedNoteLengthSeconds", maxNoteLengthSlider);
-    timingMultiplierAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        audioProcessor.getValueTreeState(), "generatedTimingMultiplier", timingMultiplierSlider);
+    remoteEndpointEditor.setText (audioProcessor.getRemoteEndpoint(), juce::dontSendNotification);
+    remoteEndpointEditor.onReturnKey = [this] { audioProcessor.setRemoteEndpoint (remoteEndpointEditor.getText()); };
+    remoteEndpointEditor.onFocusLost = [this] { audioProcessor.setRemoteEndpoint (remoteEndpointEditor.getText()); };
+    addAndMakeVisible (remoteEndpointEditor);
 
     statusLabel.setJustificationType (juce::Justification::centredLeft);
     statusLabel.setText (audioProcessor.getStatusText(), juce::dontSendNotification);
     addAndMakeVisible (statusLabel);
 
-    setSize (820, 640);
+    statsLabel.setJustificationType (juce::Justification::centredLeft);
+    statsLabel.setColour (juce::Label::textColourId, juce::Colours::white.withAlpha (0.72f));
+    addAndMakeVisible (statsLabel);
+    updateStatsLabel();
+
+    activityEditor.setMultiLine (true);
+    activityEditor.setReadOnly (true);
+    activityEditor.setScrollbarsShown (false);
+    activityEditor.setCaretVisible (false);
+    activityEditor.setPopupMenuEnabled (false);
+    activityEditor.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff11191b));
+    activityEditor.setColour (juce::TextEditor::outlineColourId, juce::Colours::white.withAlpha (0.16f));
+    activityEditor.setColour (juce::TextEditor::textColourId, juce::Colours::white.withAlpha (0.78f));
+    activityEditor.setFont (juce::FontOptions (13.0f));
+    addAndMakeVisible (activityEditor);
+
+    toolSummaryEditor.setMultiLine (true);
+    toolSummaryEditor.setReadOnly (true);
+    toolSummaryEditor.setScrollbarsShown (false);
+    toolSummaryEditor.setCaretVisible (false);
+    toolSummaryEditor.setPopupMenuEnabled (false);
+    toolSummaryEditor.setTextToShowWhenEmpty ("Latest MIDI/tool summary will appear here.", juce::Colours::grey);
+    toolSummaryEditor.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff142025));
+    toolSummaryEditor.setColour (juce::TextEditor::outlineColourId, juce::Colours::white.withAlpha (0.18f));
+    toolSummaryEditor.setColour (juce::TextEditor::textColourId, juce::Colour (0xffd8f7e4));
+    toolSummaryEditor.setFont (juce::FontOptions (13.0f));
+    addAndMakeVisible (toolSummaryEditor);
+
+    setResizable (true, true);
+    setResizeLimits (420, 300, 1800, 1400);
+    setSize (900, 620);
     startTimerHz (20);
 }
 
 NJamPluginEditor::~NJamPluginEditor()
 {
     stopTimer();
-    modelChooser.reset();
-    if (contextRollComponent != nullptr)
-        contextRollComponent->shutdown();
-    if (outputRollComponent != nullptr)
-        outputRollComponent->shutdown();
-    contextRollComponent.reset();
-    outputRollComponent.reset();
-    keyboardState.removeListener (this);
 }
 
 void NJamPluginEditor::paint (juce::Graphics& g)
@@ -376,198 +243,109 @@ void NJamPluginEditor::paint (juce::Graphics& g)
     g.fillAll (getLookAndFeel().findColour (juce::ResizableWindow::backgroundColourId));
 
     auto bounds = getLocalBounds().reduced (10);
-    auto leftPanel = bounds.removeFromLeft (static_cast<int> (bounds.getWidth() * 0.42f));
-    bounds.removeFromLeft (10);
-    auto rightPanel = bounds;
 
     g.setColour (juce::Colours::darkgrey.withAlpha (0.45f));
-    g.fillRoundedRectangle (leftPanel.toFloat(), 10.0f);
-    g.fillRoundedRectangle (rightPanel.toFloat(), 10.0f);
+    g.fillRoundedRectangle (bounds.toFloat(), 10.0f);
 
     g.setColour (juce::Colours::white);
     g.setFont (15.0f);
-    g.drawFittedText ("Controls", leftPanel.reduced (12, 10).removeFromTop (24), juce::Justification::centredLeft, 1);
-    g.drawFittedText ("Monitor", rightPanel.reduced (12, 10).removeFromTop (24), juce::Justification::centredLeft, 1);
+    g.drawFittedText ("Chat", bounds.reduced (12, 10).removeFromTop (24), juce::Justification::centredLeft, 1);
+}
 
-    auto infoArea = rightPanel.reduced (12);
-    infoArea.removeFromTop (28);
+void NJamPluginEditor::resized()
+{
+    auto bounds = getLocalBounds();
+    const int outerMargin = bounds.getWidth() < 520 || bounds.getHeight() < 360 ? 6 : 10;
+    bounds = bounds.reduced (outerMargin);
 
-    auto modelArea = infoArea.removeFromTop (38);
-    g.setFont (13.0f);
-    g.drawFittedText ("Model: " + audioProcessor.getLoadedModelFileName(), modelArea, juce::Justification::centredLeft, 2);
+    auto chatArea = bounds.reduced (12);
+    chatArea.removeFromTop (28);
 
-    infoArea.removeFromTop (4);
-    auto statusArea = infoArea.removeFromTop (24);
-    juce::ignoreUnused (statusArea);
+    chatLabel.setBounds (chatArea.removeFromTop (26));
 
-    infoArea.removeFromTop (6);
-    auto contextInfoArea = infoArea.removeFromTop (44);
-    g.drawFittedText (audioProcessor.getModelContextSummary(), contextInfoArea, juce::Justification::centredLeft, 3);
+    const bool compactEndpoint = chatArea.getWidth() < 560;
+    if (compactEndpoint)
+    {
+        auto endpointTopRow = chatArea.removeFromTop (28);
+        remoteModelToggle.setBounds (endpointTopRow.removeFromLeft (92));
+        endpointLabel.setBounds (endpointTopRow);
+        remoteEndpointEditor.setBounds (chatArea.removeFromTop (30));
+    }
+    else
+    {
+        auto endpointRow = chatArea.removeFromTop (30);
+        remoteModelToggle.setBounds (endpointRow.removeFromLeft (90));
+        endpointLabel.setBounds (endpointRow.removeFromLeft (76));
+        remoteEndpointEditor.setBounds (endpointRow);
+    }
 
-    infoArea.removeFromTop (12);
-    g.drawFittedText ("Live Context", infoArea.removeFromTop (20), juce::Justification::centredLeft, 1);
-    infoArea.removeFromTop (120);
-    infoArea.removeFromTop (10);
-    g.drawFittedText ("Generated Output", infoArea.removeFromTop (20), juce::Justification::centredLeft, 1);
-    infoArea.removeFromTop (120);
-    infoArea.removeFromTop (12);
-    auto statsArea = infoArea;
+    chatArea.removeFromTop (6);
 
+    statusLabel.setBounds (chatArea.removeFromTop (24));
+    statsLabel.setBounds (chatArea.removeFromTop (24));
+    const int activityHeight = juce::jlimit (42, 88, chatArea.getHeight() / 7);
+    activityEditor.setBounds (chatArea.removeFromTop (activityHeight));
+    chatArea.removeFromTop (6);
+    const int summaryHeight = juce::jlimit (36, 62, chatArea.getHeight() / 10);
+    toolSummaryEditor.setBounds (chatArea.removeFromTop (summaryHeight));
+    chatArea.removeFromTop (6);
+
+    const int promptHeight = juce::jlimit (64, 104, chatArea.getHeight() / 5);
+    auto promptRow = chatArea.removeFromBottom (promptHeight);
+    chatArea.removeFromBottom (8);
+
+    chatTranscriptViewport.setBounds (chatArea);
+    if (chatTranscriptComponent != nullptr)
+        chatTranscriptComponent->setTranscript (audioProcessor.getChatTranscript(),
+                                                chatTranscriptViewport.getMaximumVisibleWidth());
+
+    const int buttonWidth = juce::jlimit (72, 104, promptRow.getWidth() / 5);
+    auto promptButtons = promptRow.removeFromRight (buttonWidth);
+    promptRow.removeFromRight (4);
+
+    const int buttonHeight = juce::jmax (28, (promptButtons.getHeight() - 6) / 2);
+    sendChatButton.setBounds (promptButtons.removeFromTop (buttonHeight).reduced (0, 1));
+    promptButtons.removeFromTop (4);
+    clearChatButton.setBounds (promptButtons.removeFromTop (buttonHeight).reduced (0, 1));
+    chatPromptEditor.setBounds (promptRow.reduced (0, 1));
+}
+
+void NJamPluginEditor::updateStatsLabel()
+{
     if (audioProcessor.hasInferenceStats())
     {
         const auto stats = audioProcessor.getLastInferenceStats();
         std::ostringstream oss;
         oss << std::fixed << std::setprecision (2)
-            << "Prompt tokens: " << stats.num_tokens_in_prompt << "\n"
-            << "Response tokens: " << stats.num_tokens_in_response << "\n"
-            << "Prefill tok/s: " << stats.prompt_tokens_per_second << "\n"
-            << "Inference tok/s: " << stats.inference_tokens_per_second << "\n"
-            << "Total time (s): " << stats.total_time_taken_for_inference;
-        g.drawFittedText (oss.str(), statsArea, juce::Justification::topLeft, 6);
+            << "Prompt " << stats.num_tokens_in_prompt
+            << " | Response " << stats.num_tokens_in_response
+            << " | Prefill " << stats.prompt_tokens_per_second << " tok/s"
+            << " | Inference " << stats.inference_tokens_per_second << " tok/s"
+            << " | Total " << stats.total_time_taken_for_inference << " s";
+        statsLabel.setText (oss.str(), juce::dontSendNotification);
+        return;
     }
-    else
-    {
-        g.drawFittedText ("No inference stats yet.", statsArea, juce::Justification::topLeft, 1);
-    }
-}
 
-void NJamPluginEditor::resized()
-{
-    auto bounds = getLocalBounds().reduced (10);
-    auto leftPanel = bounds.removeFromLeft (static_cast<int> (bounds.getWidth() * 0.42f));
-    bounds.removeFromLeft (10);
-    auto rightPanel = bounds;
-
-    auto controlsArea = leftPanel.reduced (12);
-    controlsArea.removeFromTop (28);
-
-    auto keyboardArea = controlsArea.removeFromTop (92);
-    keyboardComponent.setBounds (keyboardArea);
-
-    controlsArea.removeFromTop (10);
-    auto buttonRow = controlsArea.removeFromTop (30);
-    btn.setBounds (buttonRow.removeFromLeft (120));
-    buttonRow.removeFromLeft (8);
-    loadModelButton.setBounds (buttonRow.removeFromLeft (120));
-
-    controlsArea.removeFromTop (14);
-    auto sliderRow = controlsArea.removeFromTop (30);
-    waitTimeLabel.setBounds (sliderRow.removeFromLeft (100));
-    waitTimeSlider.setBounds (sliderRow);
-
-    controlsArea.removeFromTop (8);
-    auto contextRow = controlsArea.removeFromTop (30);
-    contextLengthLabel.setBounds (contextRow.removeFromLeft (100));
-    auto buttonWidth = contextRow.getWidth() / 4;
-    ctx128Button.setBounds (contextRow.removeFromLeft (buttonWidth).reduced (1, 0));
-    ctx256Button.setBounds (contextRow.removeFromLeft (buttonWidth).reduced (1, 0));
-    ctx512Button.setBounds (contextRow.removeFromLeft (buttonWidth).reduced (1, 0));
-    ctx1024Button.setBounds (contextRow.reduced (1, 0));
-
-    controlsArea.removeFromTop (8);
-    auto tokensRow = controlsArea.removeFromTop (30);
-    maxTokensLabel.setBounds (tokensRow.removeFromLeft (100));
-    auto tokenButtonWidth = tokensRow.getWidth() / 4;
-    tokens32Button.setBounds (tokensRow.removeFromLeft (tokenButtonWidth).reduced (1, 0));
-    tokens64Button.setBounds (tokensRow.removeFromLeft (tokenButtonWidth).reduced (1, 0));
-    tokens128Button.setBounds (tokensRow.removeFromLeft (tokenButtonWidth).reduced (1, 0));
-    tokens256Button.setBounds (tokensRow.reduced (1, 0));
-
-    controlsArea.removeFromTop (8);
-    auto selfListenRow = controlsArea.removeFromTop (30);
-    selfListenLabel.setBounds (selfListenRow.removeFromLeft (100));
-    selfListenSlider.setBounds (selfListenRow);
-
-    controlsArea.removeFromTop (8);
-    auto lookBackTimeRow = controlsArea.removeFromTop (30);
-    lookBackTimeLabel.setBounds (lookBackTimeRow.removeFromLeft (100));
-    lookBackTimeSlider.setBounds (lookBackTimeRow);
-
-    controlsArea.removeFromTop (8);
-    auto maxNoteLengthRow = controlsArea.removeFromTop (30);
-    maxNoteLengthLabel.setBounds (maxNoteLengthRow.removeFromLeft (100));
-    maxNoteLengthSlider.setBounds (maxNoteLengthRow);
-
-    controlsArea.removeFromTop (8);
-    auto timingMultiplierRow = controlsArea.removeFromTop (30);
-    timingMultiplierLabel.setBounds (timingMultiplierRow.removeFromLeft (100));
-    timingMultiplierSlider.setBounds (timingMultiplierRow);
-
-    auto infoArea = rightPanel.reduced (12);
-    infoArea.removeFromTop (28);
-    infoArea.removeFromTop (38);
-    infoArea.removeFromTop (4);
-    statusLabel.setBounds (infoArea.removeFromTop (24));
-    infoArea.removeFromTop (6);
-    infoArea.removeFromTop (44);
-    infoArea.removeFromTop (12);
-    infoArea.removeFromTop (20);
-    if (contextRollComponent != nullptr)
-        contextRollComponent->setBounds (infoArea.removeFromTop (120));
-    else
-        infoArea.removeFromTop (120);
-    infoArea.removeFromTop (10);
-    infoArea.removeFromTop (20);
-    if (outputRollComponent != nullptr)
-        outputRollComponent->setBounds (infoArea.removeFromTop (120));
-    else
-        infoArea.removeFromTop (120);
+    statsLabel.setText ("No inference stats yet.", juce::dontSendNotification);
 }
 
 void NJamPluginEditor::timerCallback()
 {
-    btn.setToggleState (audioProcessor.isMidiThruEnabled(), juce::dontSendNotification);
+    remoteModelToggle.setToggleState (true, juce::dontSendNotification);
+    if (! remoteEndpointEditor.hasKeyboardFocus (true))
+        remoteEndpointEditor.setText (audioProcessor.getRemoteEndpoint(), juce::dontSendNotification);
+    if (chatTranscriptComponent != nullptr)
+    {
+        const auto previousMax = chatTranscriptViewport.getViewHeight() - chatTranscriptViewport.getHeight();
+        const bool wasNearBottom = chatTranscriptViewport.getViewPositionY() >= previousMax - 12;
+        chatTranscriptComponent->setTranscript (audioProcessor.getChatTranscript(),
+                                                chatTranscriptViewport.getMaximumVisibleWidth());
+        if (wasNearBottom)
+            chatTranscriptViewport.setViewPosition (0, juce::jmax (0, chatTranscriptComponent->getHeight() - chatTranscriptViewport.getHeight()));
+    }
     statusLabel.setText (audioProcessor.getStatusText(), juce::dontSendNotification);
-    const auto contextLength = audioProcessor.getContextLength();
-    ctx128Button.setToggleState (contextLength == 256, juce::dontSendNotification);
-    ctx256Button.setToggleState (contextLength == 512, juce::dontSendNotification);
-    ctx512Button.setToggleState (contextLength == 1024, juce::dontSendNotification);
-    ctx1024Button.setToggleState (contextLength == 2048, juce::dontSendNotification);
-    const auto maxResponseTokens = audioProcessor.getMaxResponseTokens();
-    tokens32Button.setToggleState (maxResponseTokens == 64, juce::dontSendNotification);
-    tokens64Button.setToggleState (maxResponseTokens == 128, juce::dontSendNotification);
-    tokens128Button.setToggleState (maxResponseTokens == 256, juce::dontSendNotification);
-    tokens256Button.setToggleState (maxResponseTokens == 512, juce::dontSendNotification);
-    refreshPianoRolls();
-    if (contextRollComponent != nullptr)
-        contextRollComponent->requestRender();
-    if (outputRollComponent != nullptr)
-        outputRollComponent->requestRender();
+    activityEditor.setText (audioProcessor.getAgentActivityText(), false);
+    toolSummaryEditor.setText (audioProcessor.getLatestToolSummaryText(), false);
+    updateStatsLabel();
     repaint();
-}
-
-void NJamPluginEditor::handleNoteOn (juce::MidiKeyboardState* source,
-                                     int midiChannel,
-                                     int midiNoteNumber,
-                                     float velocity)
-{
-    juce::ignoreUnused (source);
-    handleKeyboardMidiMessage (juce::MidiMessage::noteOn (midiChannel, midiNoteNumber, velocity));
-}
-
-void NJamPluginEditor::handleNoteOff (juce::MidiKeyboardState* source,
-                                      int midiChannel,
-                                      int midiNoteNumber,
-                                      float velocity)
-{
-    juce::ignoreUnused (source);
-    handleKeyboardMidiMessage (juce::MidiMessage::noteOff (midiChannel, midiNoteNumber, velocity));
-}
-
-void NJamPluginEditor::handleKeyboardMidiMessage (const juce::MidiMessage& message)
-{
-    juce::ignoreUnused (audioProcessor);
-    this->audioProcessor.handleKeyboardMidiMessage (message);
-}
-
-void NJamPluginEditor::refreshPianoRolls()
-{
-    PianoRollDisplaySnapshot snapshot;
-    if (audioProcessor.getContextRollSnapshotIfNew (lastContextRollRevision, snapshot))
-        if (contextRollComponent != nullptr)
-            contextRollComponent->setSnapshot (snapshot);
-
-    if (audioProcessor.getOutputRollSnapshotIfNew (lastOutputRollRevision, snapshot))
-        if (outputRollComponent != nullptr)
-            outputRollComponent->setSnapshot (snapshot);
 }

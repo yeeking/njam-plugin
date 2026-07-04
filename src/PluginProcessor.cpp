@@ -13,6 +13,7 @@
 #include <limits>
 #include <map>
 #include <sstream>
+#include <thread>
 #include <tuple>
 
 namespace
@@ -21,6 +22,8 @@ constexpr double contextHistoryWindowSeconds = 20.0;
 constexpr double pianoRollWindowSeconds = 10.0;
 constexpr double captureOverlayFadeSeconds = 4.0;
 constexpr double captureOverlayHoldSeconds = 1.5;
+constexpr int remoteChatContextLength = 32768;
+constexpr int remoteChatMaxResponseTokens = -1;
 
 struct NotePair
 {
@@ -31,6 +34,118 @@ struct NotePair
 };
 
 using NoteKey = std::tuple<int, int>;
+
+juce::String shortenForTranscript (juce::String text, int maxLength = 180)
+{
+    text = text.trim().replaceCharacter ('\n', ' ');
+    if (text.length() <= maxLength)
+        return text;
+
+    return text.substring (0, maxLength - 3).trim() + "...";
+}
+
+juce::String activitySymbolForState (const juce::String& state)
+{
+    if (state == "calling tool") return "->";
+    if (state == "tool complete") return "ok";
+    if (state == "tool failed") return "!!";
+    if (state == "calling model") return "..";
+    if (state == "thinking") return "..";
+    if (state == "done") return "ok";
+    return "-";
+}
+
+bool shouldRecordActivityState (const juce::String& state)
+{
+    return state == "calling tool"
+        || state == "tool complete"
+        || state == "tool failed"
+        || state == "calling model"
+        || state == "thinking"
+        || state == "done";
+}
+
+juce::String appendActivityLine (juce::String activity, const AgentStatusEvent& event, int maxLines = 9)
+{
+    if (! shouldRecordActivityState (event.state))
+        return activity;
+
+    const auto line = activitySymbolForState (event.state) + " "
+        + event.state
+        + (event.detail.isNotEmpty() ? ": " + event.detail : juce::String());
+
+    juce::StringArray lines;
+    lines.addLines (activity);
+    if (lines.isEmpty() || lines[lines.size() - 1] != line)
+        lines.add (line);
+
+    while (lines.size() > maxLines)
+        lines.remove (0);
+
+    return lines.joinIntoString ("\n");
+}
+
+juce::String extractParenthesizedDetails (const juce::String& text)
+{
+    const int open = text.indexOfChar ('(');
+    const int close = text.lastIndexOfChar (')');
+    if (open < 0 || close <= open)
+        return {};
+
+    return text.substring (open + 1, close);
+}
+
+juce::String extractDetailField (const juce::String& details, const juce::String& key)
+{
+    const auto prefix = key + "=";
+    const int start = details.indexOf (prefix);
+    if (start < 0)
+        return {};
+
+    const int valueStart = start + prefix.length();
+    int valueEnd = details.indexOf (valueStart, ", ");
+    if (valueEnd < 0)
+        valueEnd = details.length();
+
+    return details.substring (valueStart, valueEnd).trim();
+}
+
+juce::String makeToolSummaryLine (const ToolInvocation& call, const ToolResult* result)
+{
+    if (result == nullptr)
+        return {};
+
+    if (! result->ok)
+        return "Latest tool issue: " + call.name + " failed";
+
+    const auto content = result->content.trim();
+    if (call.name == "analyze_midi")
+    {
+        const auto details = extractParenthesizedDetails (content);
+        juce::StringArray parts;
+        for (const auto& key : { "score", "assessment", "next", "notes", "tempo", "pitch_range", "duration", "density", "velocity_range", "gap_unique" })
+        {
+            const auto value = extractDetailField (details, key);
+            if (value.isNotEmpty())
+                parts.add (juce::String (key) + "=" + value);
+        }
+
+        return parts.isEmpty()
+            ? "Latest analysis: " + shortenForTranscript (content, 220)
+            : "Latest analysis: " + parts.joinIntoString (" | ");
+    }
+
+    if (call.name == "play_midi")
+        return "Playback: " + shortenForTranscript (content, 220);
+
+    if (call.name.startsWith ("fit_midi_") || call.name == "humanize_midi")
+        return "Latest repair: " + call.name + " -> " + shortenForTranscript (content, 220);
+
+    if (call.name == "generate_formula_midi" || call.name == "combine_midi")
+        return "Latest MIDI: " + shortenForTranscript (content, 220);
+
+    return {};
+}
 
 std::vector<NotePair> extractCompleteNotePairs (const juce::MidiBuffer& sourceBuffer,
                                                 int defaultDurationSamples)
@@ -228,10 +343,17 @@ NJamPluginProcessor::NJamPluginProcessor()
 , llmControllerP{std::make_shared<LLMController>()}
 , inferenceThread{llmControllerP}
 {
+    remoteLLM.setEndpoint ("http://localhost:2224/v1/");
+    chatAgent.setMidiPlaybackHandler ([this] (const juce::File& midiFile)
+    {
+        return scheduleMidiFileForPlayback (midiFile);
+    });
 }
 
 NJamPluginProcessor::~NJamPluginProcessor()
 {
+    if (chatThread.joinable())
+        chatThread.join();
     llmControllerP->requestStop();
     inferenceThread.stop();
     llmControllerP->unloadModel();
@@ -393,6 +515,15 @@ void NJamPluginProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     else
     {
         midiMessages.swapWith(inputMidiMessages);
+    }
+
+    juce::MidiBuffer pendingPlayback;
+    consumePendingPlaybackMidi (pendingPlayback);
+    if (pendingPlayback.getNumEvents() > 0)
+    {
+        lastModelOutputBuffer = normalizeBufferToSampleZero (pendingPlayback);
+        storeOutputPreview (pendingPlayback);
+        futureMidiFromLLM.addEvents (pendingPlayback, 0, -1, 0);
     }
 
     pruneContextHistory (blockEndSamples);
@@ -726,6 +857,10 @@ juce::String NJamPluginProcessor::getLoadedModelFileName() const
 
 juce::String NJamPluginProcessor::getStatusText() const
 {
+    const auto chatStatus = getAgentStatusText();
+    if (chatStatus.isNotEmpty() && chatStatus != "ready")
+        return "Agent: " + chatStatus;
+
     if (isSuspended())
         return "Status: Suspended";
 
@@ -866,6 +1001,210 @@ bool NJamPluginProcessor::getContextRollSnapshotIfNew (uint64_t& lastSeenRevisio
 bool NJamPluginProcessor::getOutputRollSnapshotIfNew (uint64_t& lastSeenRevision, PianoRollDisplaySnapshot& snapshot) const
 {
     return getRollSnapshotIfNew (outputRollSnapshot, outputRollRevision, lastSeenRevision, snapshot);
+}
+
+void NJamPluginProcessor::sendChatPrompt (const juce::String& prompt)
+{
+    const auto trimmed = prompt.trim();
+    if (trimmed.isEmpty())
+        return;
+
+    if (chatRunInProgress.exchange (true))
+    {
+        const juce::ScopedLock scopedLock (chatLock);
+        chatTranscript << "Agent: [Still working on the previous prompt. Wait for the current model call to finish before sending another.]\n\n";
+        agentStatus = "busy: waiting for model";
+        ++chatRevision;
+        return;
+    }
+
+    {
+        const juce::ScopedLock scopedLock (chatLock);
+        chatTranscript << "You: " << trimmed << "\n";
+        agentStatus = "thinking: queued prompt";
+        agentActivity = "-> queued prompt";
+        latestToolSummary = "Queued: " + shortenForTranscript (trimmed, 140);
+        ++chatRevision;
+    }
+
+    if (chatThread.joinable())
+        chatThread.join();
+
+    chatThread = std::thread ([this, trimmed]
+    {
+        auto statusCallback = [this] (const AgentStatusEvent& event)
+        {
+            const juce::ScopedLock scopedLock (chatLock);
+            agentStatus = event.state + (event.detail.isNotEmpty() ? ": " + event.detail : "");
+            agentActivity = appendActivityLine (agentActivity, event);
+            ++chatRevision;
+        };
+
+        AgentRunResult result;
+        try
+        {
+            result = chatAgent.run (remoteLLM, trimmed, remoteChatContextLength,
+                                    remoteChatMaxResponseTokens, statusCallback);
+        }
+        catch (const std::exception& e)
+        {
+            result.finalText = "Agent error: " + juce::String (e.what());
+        }
+        catch (...)
+        {
+            result.finalText = "Agent error.";
+        }
+
+        {
+            const juce::ScopedLock scopedLock (chatLock);
+            for (size_t i = 0; i < result.toolCalls.size(); ++i)
+            {
+                const auto& call = result.toolCalls[i];
+                const auto* toolResult = i < result.toolResults.size() ? &result.toolResults[i] : nullptr;
+                const auto outcome = toolResult == nullptr ? juce::String ("done")
+                    : (toolResult->ok ? juce::String ("ok") : juce::String ("failed"));
+                const auto detail = toolResult == nullptr ? juce::String()
+                    : shortenForTranscript (toolResult->content);
+                const auto summary = makeToolSummaryLine (call, toolResult);
+                if (summary.isNotEmpty())
+                    latestToolSummary = summary;
+
+                chatTranscript << "Agent: [Tool " << call.name << " -> " << outcome;
+                if (detail.isNotEmpty())
+                    chatTranscript << ": " << detail;
+                chatTranscript << "]\n";
+            }
+
+            chatTranscript << "Agent: " << result.finalText << "\n\n";
+            agentStatus = "ready";
+            agentActivity = appendActivityLine (agentActivity, { "done", "ready" });
+            ++chatRevision;
+        }
+
+        {
+            std::lock_guard<std::mutex> statsLock (inferenceStatsMutex);
+            lastInferenceStats = result.stats;
+            haveInferenceStats = true;
+        }
+
+        chatRunInProgress.store (false);
+    });
+}
+
+juce::String NJamPluginProcessor::getChatTranscript() const
+{
+    const juce::ScopedLock scopedLock (chatLock);
+    return chatTranscript;
+}
+
+juce::String NJamPluginProcessor::getAgentStatusText() const
+{
+    const juce::ScopedLock scopedLock (chatLock);
+    return agentStatus;
+}
+
+juce::String NJamPluginProcessor::getAgentActivityText() const
+{
+    const juce::ScopedLock scopedLock (chatLock);
+    return agentActivity;
+}
+
+juce::String NJamPluginProcessor::getLatestToolSummaryText() const
+{
+    const juce::ScopedLock scopedLock (chatLock);
+    return latestToolSummary;
+}
+
+void NJamPluginProcessor::clearChat()
+{
+    if (chatRunInProgress.load())
+        return;
+
+    chatAgent.reset();
+    const juce::ScopedLock scopedLock (chatLock);
+    chatTranscript.clear();
+    agentActivity.clear();
+    latestToolSummary.clear();
+    agentStatus = "ready";
+    ++chatRevision;
+}
+
+void NJamPluginProcessor::setUseRemoteModel (bool shouldUseRemote)
+{
+    useRemoteModel.store (shouldUseRemote);
+}
+
+bool NJamPluginProcessor::getUseRemoteModel() const
+{
+    return useRemoteModel.load();
+}
+
+void NJamPluginProcessor::setRemoteEndpoint (const juce::String& endpoint)
+{
+    remoteLLM.setEndpoint (endpoint);
+}
+
+juce::String NJamPluginProcessor::getRemoteEndpoint() const
+{
+    return remoteLLM.getEndpoint();
+}
+
+ToolResult NJamPluginProcessor::scheduleMidiFileForPlayback (const juce::File& midiFile)
+{
+    if (! midiFile.existsAsFile())
+        return { false, "MIDI file not found: " + midiFile.getFullPathName() };
+
+    juce::FileInputStream stream (midiFile);
+    if (! stream.openedOk())
+        return { false, "Could not open MIDI file: " + midiFile.getFullPathName() };
+
+    juce::MidiFile loadedMidi;
+    if (! loadedMidi.readFrom (stream))
+        return { false, "Could not read MIDI file: " + midiFile.getFullPathName() };
+
+    loadedMidi.convertTimestampTicksToSeconds();
+
+    const auto playbackSampleRate = getSampleRate() > 0.0 ? getSampleRate() : 44100.0;
+    juce::MidiBuffer scheduledMidi;
+    int eventCount = 0;
+    int lastSample = 0;
+
+    for (int trackIndex = 0; trackIndex < loadedMidi.getNumTracks(); ++trackIndex)
+    {
+        const auto* track = loadedMidi.getTrack (trackIndex);
+        if (track == nullptr)
+            continue;
+
+        for (int eventIndex = 0; eventIndex < track->getNumEvents(); ++eventIndex)
+        {
+            const auto* event = track->getEventPointer (eventIndex);
+            if (event == nullptr)
+                continue;
+
+            auto message = event->message;
+            if (message.isMetaEvent())
+                continue;
+
+            const int samplePosition = juce::jmax (0, juce::roundToInt (message.getTimeStamp() * playbackSampleRate));
+            message.setTimeStamp (static_cast<double> (samplePosition));
+            scheduledMidi.addEvent (message, samplePosition);
+            lastSample = juce::jmax (lastSample, samplePosition);
+            ++eventCount;
+        }
+    }
+
+    if (eventCount == 0)
+        return { false, "MIDI file contained no playable events: " + midiFile.getFullPathName() };
+
+    {
+        const std::lock_guard<std::mutex> lock (pendingPlaybackMidiMutex);
+        pendingPlaybackMidi.addEvents (scheduledMidi, 0, -1, 0);
+    }
+
+    const auto durationSeconds = static_cast<double> (lastSample) / playbackSampleRate;
+    return { true, "Queued MIDI playback: " + midiFile.getFullPathName()
+                   + " (" + juce::String (eventCount) + " events, "
+                   + juce::String (durationSeconds, 2) + " s)" };
 }
 
 void NJamPluginProcessor::updateMaxSamplesWithoutNotes()
@@ -1071,6 +1410,12 @@ juce::MidiBuffer NJamPluginProcessor::makeRecentContextMidi (int64_t latestSampl
     }
 
     return recentBuffer;
+}
+
+void NJamPluginProcessor::consumePendingPlaybackMidi (juce::MidiBuffer& destination)
+{
+    const std::lock_guard<std::mutex> lock (pendingPlaybackMidiMutex);
+    destination.swapWith (pendingPlaybackMidi);
 }
 
 int64_t NJamPluginProcessor::getLookBackSamples() const

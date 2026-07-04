@@ -1,6 +1,5 @@
-# MIDI jammer plugin using neural networks
 
-The aim of this plugin is to be a MIDI improviser. You play MIDI in and it generates MIDI in response. 
+# Lambda music
 
 ## How to install 
 
