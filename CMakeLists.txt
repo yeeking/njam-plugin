@@ -4,7 +4,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 
-project(myk-neural-jammer VERSION 0.0.1)
+project(music-agent-team VERSION 0.0.1)
 
 add_subdirectory(./libs/JUCE JUCE)  
 # makes the static library build work with JUCE
@@ -12,7 +12,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # llama.cpp / ggml build toggles (exposed at the top-level project)
 option(NJAM_LLAMA_NATIVE "Build ggml with native CPU tuning (-march=native where applicable)" ON)
-option(NJAM_LLAMA_VULKAN "Enable Vulkan backend in ggml" OFF)
+option(NJAM_LLAMA_VULKAN "Enable Vulkan backend in ggml" ON)
 option(NJAM_LLAMA_OPENMP "Enable OpenMP in ggml CPU backend" ON)
 option(NJAM_LLAMA_LTO "Enable LTO/IPO for ggml/llama targets (if toolchain supports it)" OFF)
 option(NJAM_LLAMA_BLAS "Enable BLAS backend (mainly helps prompt/prefill throughput)" OFF)
@@ -65,11 +65,90 @@ src/LLMController.cpp
 )
 target_link_libraries(myk-model-tester PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
 
+juce_add_console_app(music-agent-core-tests
+    PRODUCT_NAME "music-agent-core-tests")
+
+juce_generate_juce_header(music-agent-core-tests)
+
+target_sources(music-agent-core-tests
+    PRIVATE
+        src/tests/MusicAgentCoreTests.cpp
+        src/OpenAICompatibleLLM.cpp
+        src/MusicAgentCore.cpp
+        src/MusicTools.cpp)
+
+target_compile_definitions(music-agent-core-tests
+    PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0)
+
+target_link_libraries(music-agent-core-tests
+    PRIVATE
+        juce::juce_audio_basics
+        juce::juce_audio_formats
+        juce::juce_core
+    PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_warning_flags)
+
+juce_add_console_app(music-agent-remote-probe
+    PRODUCT_NAME "music-agent-remote-probe")
+
+juce_generate_juce_header(music-agent-remote-probe)
+
+target_sources(music-agent-remote-probe
+    PRIVATE
+        src/tools/remote_agent_probe.cpp
+        src/OpenAICompatibleLLM.cpp
+        src/MusicAgentCore.cpp
+        src/MusicTools.cpp)
+
+target_compile_definitions(music-agent-remote-probe
+    PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0)
+
+target_link_libraries(music-agent-remote-probe
+    PRIVATE
+        juce::juce_audio_basics
+        juce::juce_audio_formats
+        juce::juce_core
+        juce::juce_events
+    PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_warning_flags)
+
+juce_add_console_app(myk-midi-continuator
+    PRODUCT_NAME "myk-midi-continuator")
+
+juce_generate_juce_header(myk-midi-continuator)
+
+target_sources(myk-midi-continuator
+    PRIVATE
+        src/tools/midi_continuator.cpp
+        src/LLMController.cpp
+        src/NJamLanguage.cpp)
+
+target_compile_definitions(myk-midi-continuator
+    PRIVATE
+        NJAM_BUILD_TYPE="$<CONFIG>"
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0)
+
+target_link_libraries(myk-midi-continuator
+    PRIVATE
+        juce::juce_audio_basics
+        juce::juce_core
+        llama
+    PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_warning_flags)
+
 
 # ## JUCE plugin
 # ##
 
-juce_add_plugin(myk-neural-jammer-plugin
+juce_add_plugin(music-agent-team-plugin
     # VERSION ...                               # Set this if the plugin version is different to the project version
     # ICON_BIG ...                              # ICON_* arguments specify a path to an image file to use as an icon for the Standalone
     # ICON_SMALL ...
@@ -81,26 +160,29 @@ juce_add_plugin(myk-neural-jammer-plugin
     # EDITOR_WANTS_KEYBOARD_FOCUS TRUE/FALSE    # Does the editor need keyboard focus?
     COPY_PLUGIN_AFTER_BUILD TRUE        # Should the plugin be installed to a default location after building?
     PLUGIN_MANUFACTURER_CODE Yeek               # A four-character manufacturer id with at least one upper-case character
-    PLUGIN_CODE Nja1                            # A unique four-character plugin id with exactly one upper-case character
+    PLUGIN_CODE Mat1                            # A unique four-character plugin id with exactly one upper-case character
                                                 # GarageBand 10.3 requires the first letter to be upper-case, and the remaining letters to be lower-case
     FORMATS AU VST3 Standalone                  # The formats to build. Other valid formats are: AAX Unity VST AU AUv3
-    PRODUCT_NAME "myk-njam-plugin"        # The name of the final executable, which can differ from the target name
+    PRODUCT_NAME "Music agent team"        # The name of the final executable, which can differ from the target name
     )
 
-juce_generate_juce_header(myk-neural-jammer-plugin)
+juce_generate_juce_header(music-agent-team-plugin)
 
-target_sources(myk-neural-jammer-plugin
+target_sources(music-agent-team-plugin
     PRIVATE
     src/PluginEditor.cpp
     src/PluginProcessor.cpp
     # src/NJamLanguage.cpp
     src/LLMController.cpp
+    src/OpenAICompatibleLLM.cpp
     src/InferenceThreadManager.cpp
     src/NJamLanguage.cpp
+    src/MusicAgentCore.cpp
+    src/MusicTools.cpp
 
 )
 
-target_compile_definitions(myk-neural-jammer-plugin
+target_compile_definitions(music-agent-team-plugin
     PUBLIC # 
         JUCE_ALSA=1
         JUCE_DIRECTSOUND=1
@@ -115,7 +197,7 @@ target_compile_definitions(myk-neural-jammer-plugin
         JUCE_USE_GTK=0
         JUCE_VST3_CAN_REPLACE_VST2=0)
 
-target_link_libraries(myk-neural-jammer-plugin
+target_link_libraries(music-agent-team-plugin
     PRIVATE
         juce::juce_audio_utils
         juce::juce_opengl

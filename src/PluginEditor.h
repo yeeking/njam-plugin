@@ -11,12 +11,10 @@
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 
-//==============================================================================
-class OpenGLPianoRollComponent;
+class ChatTranscriptComponent;
 
-/** Editor component that exposes plugin controls and visualises prompts, outputs, and runtime status. */
+/** Editor component for the agent chat surface. */
 class NJamPluginEditor  : public juce::AudioProcessorEditor,
-                          private juce::MidiKeyboardState::Listener,
                           private juce::Timer
 {
 public:
@@ -29,52 +27,21 @@ public:
 
 private:
     void timerCallback() override;
-    void handleNoteOn (juce::MidiKeyboardState* source,
-                       int midiChannel,
-                       int midiNoteNumber,
-                       float velocity) override;
-    void handleNoteOff (juce::MidiKeyboardState* source,
-                        int midiChannel,
-                        int midiNoteNumber,
-                        float velocity) override;
-    void handleKeyboardMidiMessage (const juce::MidiMessage& message);
-    void refreshPianoRolls();
+    void updateStatsLabel();
 
-    juce::MidiKeyboardState keyboardState;
-    juce::MidiKeyboardComponent keyboardComponent;
-    juce::TextButton btn;
-    juce::TextButton loadModelButton;
-    juce::TextButton ctx128Button;
-    juce::TextButton ctx256Button;
-    juce::TextButton ctx512Button;
-    juce::TextButton ctx1024Button;
-    juce::TextButton tokens32Button;
-    juce::TextButton tokens64Button;
-    juce::TextButton tokens128Button;
-    juce::TextButton tokens256Button;
-    juce::Slider waitTimeSlider;
-    juce::Slider selfListenSlider;
-    juce::Slider lookBackTimeSlider;
-    juce::Slider maxNoteLengthSlider;
-    juce::Slider timingMultiplierSlider;
-    juce::Label waitTimeLabel;
-    juce::Label selfListenLabel;
-    juce::Label lookBackTimeLabel;
-    juce::Label maxNoteLengthLabel;
-    juce::Label timingMultiplierLabel;
-    juce::Label contextLengthLabel;
-    juce::Label maxTokensLabel;
+    juce::TextButton sendChatButton;
+    juce::TextButton clearChatButton;
+    juce::ToggleButton remoteModelToggle;
+    juce::Viewport chatTranscriptViewport;
+    std::unique_ptr<ChatTranscriptComponent> chatTranscriptComponent;
+    juce::TextEditor chatPromptEditor;
+    juce::TextEditor remoteEndpointEditor;
+    juce::TextEditor activityEditor;
+    juce::TextEditor toolSummaryEditor;
+    juce::Label chatLabel;
+    juce::Label endpointLabel;
     juce::Label statusLabel;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> waitTimeAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> selfListenAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> lookBackTimeAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> maxNoteLengthAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> timingMultiplierAttachment;
-    std::unique_ptr<juce::FileChooser> modelChooser;
-    std::unique_ptr<OpenGLPianoRollComponent> contextRollComponent;
-    std::unique_ptr<OpenGLPianoRollComponent> outputRollComponent;
-    uint64_t lastContextRollRevision{0};
-    uint64_t lastOutputRollRevision{0};
+    juce::Label statsLabel;
 
     // This reference is provided as a quick way for your editor to
     // access the processor object that created it.
