@@ -1,5 +1,6 @@
+# NJAM plugin
 
-# Lambda music
+Transformer-based MIDI improviser plugin
 
 ## How to install 
 
