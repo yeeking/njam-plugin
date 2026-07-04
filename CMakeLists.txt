@@ -12,7 +12,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # llama.cpp / ggml build toggles (exposed at the top-level project)
 option(NJAM_LLAMA_NATIVE "Build ggml with native CPU tuning (-march=native where applicable)" ON)
-option(NJAM_LLAMA_VULKAN "Enable Vulkan backend in ggml" OFF)
+option(NJAM_LLAMA_VULKAN "Enable Vulkan backend in ggml" ON)
 option(NJAM_LLAMA_OPENMP "Enable OpenMP in ggml CPU backend" ON)
 option(NJAM_LLAMA_LTO "Enable LTO/IPO for ggml/llama targets (if toolchain supports it)" OFF)
 option(NJAM_LLAMA_BLAS "Enable BLAS backend (mainly helps prompt/prefill throughput)" OFF)
@@ -64,6 +64,32 @@ src/tests/llama_cpp_cli.cpp
 src/LLMController.cpp
 )
 target_link_libraries(myk-model-tester PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+
+juce_add_console_app(myk-midi-continuator
+    PRODUCT_NAME "myk-midi-continuator")
+
+juce_generate_juce_header(myk-midi-continuator)
+
+target_sources(myk-midi-continuator
+    PRIVATE
+        src/tools/midi_continuator.cpp
+        src/LLMController.cpp
+        src/NJamLanguage.cpp)
+
+target_compile_definitions(myk-midi-continuator
+    PRIVATE
+        NJAM_BUILD_TYPE="$<CONFIG>"
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0)
+
+target_link_libraries(myk-midi-continuator
+    PRIVATE
+        juce::juce_audio_basics
+        juce::juce_core
+        llama
+    PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_warning_flags)
 
 
 # ## JUCE plugin

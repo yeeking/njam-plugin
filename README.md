@@ -46,8 +46,7 @@ The weights were randomised, then it was trained on the Queen Mary  Pijama datas
   year={2023}
 }
 ```
-
-## For developers
+## Building the plugin from source
 
 To build the plugin from src:
 
@@ -60,4 +59,20 @@ cd ..
 cmake -B build .
 cmake --build build --config Release -j 8
 ```
+
+## Training another model
+
+I trained that model using my small-lm toolkit, which is a generic toolkit for training small llms from known architectures:
+
+https://github.com/yeeking/small-lm-toolkit
+
+Small-lm toolkit does not provide music-specific dataset preparation. 
+
+To make a dataset which you can then train on with small-lm, you need this repo:
+
+https://github.com/yeeking/neural-jammer
+
+So it is a bit tricky for now but I've got a new repo called super-njam which will contain the data prep and training scripts.
+
+
 
