@@ -16,8 +16,6 @@
 #include "LLMController.h"
 #include "InferenceThreadManager.h"
 #include "NJamLanguage.h"
-#include "MusicAgentCore.h"
-#include "OpenAICompatibleLLM.h"
 
 //==============================================================================
 struct PianoRollDisplayNote
@@ -121,17 +119,6 @@ public:
     bool getOutputPreviewIfNew (uint64_t& lastSeenRevision, juce::MidiBuffer& midiBuffer) const;
     bool getContextRollSnapshotIfNew (uint64_t& lastSeenRevision, PianoRollDisplaySnapshot& snapshot) const;
     bool getOutputRollSnapshotIfNew (uint64_t& lastSeenRevision, PianoRollDisplaySnapshot& snapshot) const;
-    void sendChatPrompt (const juce::String& prompt);
-    juce::String getChatTranscript() const;
-    juce::String getAgentStatusText() const;
-    juce::String getAgentActivityText() const;
-    juce::String getLatestToolSummaryText() const;
-    void clearChat();
-    void setUseRemoteModel (bool shouldUseRemote);
-    bool getUseRemoteModel() const;
-    void setRemoteEndpoint (const juce::String& endpoint);
-    juce::String getRemoteEndpoint() const;
-    ToolResult scheduleMidiFileForPlayback (const juce::File& midiFile);
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     static constexpr auto modelPathParamID = "modelPath";
@@ -160,7 +147,6 @@ private:
     juce::MidiBuffer transformGeneratedMidiForPlayback (const juce::MidiBuffer& sourceBuffer) const;
     void mergeSelfListenNotes (juce::MidiBuffer& promptBuffer);
     juce::MidiBuffer makeRecentContextMidi (int64_t latestSample) const;
-    void consumePendingPlaybackMidi (juce::MidiBuffer& destination);
     int64_t getLookBackSamples() const;
     void pruneContextHistory (int64_t latestSample);
     void pruneOutputDisplayHistory (int64_t latestSample);
@@ -187,8 +173,6 @@ private:
     mutable std::mutex midiForPromptMutex;
     /** place to store midi from the llm that is played later than the current block */
     juce::MidiBuffer futureMidiFromLLM;
-    juce::MidiBuffer pendingPlaybackMidi;
-    std::mutex pendingPlaybackMidiMutex;
     juce::MidiBuffer lastModelOutputBuffer;
     juce::MidiBuffer outputDisplayHistory;
     
@@ -235,17 +219,6 @@ private:
     std::atomic<bool> midiThruEnabled{true};
     std::atomic<int> cachedModelTrainingContextLength{0};
     juce::Random selfListenRandom;
-    MusicAgentCore chatAgent;
-    OpenAICompatibleLLM remoteLLM;
-    std::atomic<bool> useRemoteModel{true};
-    std::atomic<bool> chatRunInProgress{false};
-    std::thread chatThread;
-    mutable juce::CriticalSection chatLock;
-    juce::String chatTranscript;
-    juce::String agentStatus = "ready";
-    juce::String agentActivity;
-    juce::String latestToolSummary;
-    uint64_t chatRevision{0};
     // LLMController llmController; 
     /** pass this to a thread - it creates an llmcontroller and keeps calling generate on it */
     // static void infiniteInfer(std::atomic<bool>& keepRunning);
